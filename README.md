@@ -148,16 +148,20 @@ sudo ./build/module_c_scheduler \
 - 每个连接的 **Initial CID** 承载一个分片，CID 格式：
   - `magic(1) + session_id(4) + frag_idx(1) + frag_total(1) + data_len(1) + frag_data(N)`
   - `cid_len<=20`，默认 `20`，单片最大 `12` 字节。
+- 为降低显著指纹，CID 在线路上不再直接暴露固定 magic/明文分片头，而是按每包随机 nonce 做白化混淆后再写入。
+- 分片发送时 CID 长度不固定：在 `max_cid_len` 附近随机选择（默认在 `max-4..max`），从而弱化固定长度特征。
 - 大消息自动分片：上行/下行都按 `session_id + frag_idx` 分片重组。
 - payload 不承载明文业务数据，只承载认证哈希：
   - `hash = SHA256(PSK || CID || role_tag)`
   - 上行：`CLIENT_PROOF -> SERVER_ACK`
   - 下行：`SERVER_PUSH -> CLIENT_PUSH_ACK`
+- 认证 payload 使用紧凑二进制格式（无固定 ASCII magic），并可附加随机 cover bytes，降低固定 payload 长度/前缀特征。
 - 默认启用 `picoquic_set_null_verifier()`（实验模式），证书链校验关闭，身份由上面的 `PSK + CID` 哈希认证保证。
-- 服务端维护客户端连接列表：记录 `IP / 首次消息时间 / 最近一次消息间隔 / 距今未活跃时长 / 消息计数`，超过 `1 hour` 未收到消息会自动剔除。
+- 服务端维护客户端连接列表：记录 `IP / 首次消息时间 / 最近一次消息间隔 / 距今未活跃时长 / 消息计数 / client_push_port`，超过 `1 hour` 未收到消息会自动剔除。
 - 服务端可运行时下发消息到 `all` 或指定 `ip`，下发内容也放在 CID 中（必要时分片），客户端本地打印日志。
 - 模块 A 结合：客户端可选通过 `-i <iface>` 启用背景流量画像采样，用采样的 `Dnext` 给分片连接节奏做 pacing。
-- 客户端周期上报：默认使用 `interval = (UTC_timestamp % 60) * 60 sec`，每轮发送高熵随机变量，确保不同轮次 CID 差异显著。
+- 客户端周期上报：默认基线 `interval = (UTC_timestamp % 60) * 60 sec`，并添加有界抖动（jitter）以弱化固定时序特征；每轮发送高熵随机变量，确保不同轮次 CID 差异显著。
+- 服务端下行分片间隔也加入随机抖动，避免固定 10ms 间隔模式。
 
 ### 6.2 运行服务端
 
@@ -193,7 +197,7 @@ help
 常用附加参数：
 
 - `-c <cid_len>`：服务端下发时使用的 CID 长度（`8..20`）
-- `-P <port>`：客户端监听端口（服务端下发目标端口，默认 `5544`）
+- `-P <port>`：强制客户端监听端口（默认自动使用客户端上报端口）
 
 ### 6.3 运行客户端
 
@@ -211,14 +215,14 @@ help
 可选参数：
 
 - `-c <cid_len>`：CID 长度，范围 `8..20`
-- `-L <listen_port>`：客户端下行监听端口（默认 `5544`）
+- `-L <listen_port>`：客户端下行监听端口（默认随机高位端口）
 - `-u <unit_sec>`：间隔单位秒（默认 `60`，即按“分钟”执行 `UTC%60`）
 - `-e <bytes>`：每轮高熵消息长度（默认 = `cid_len - 8`）
 - `-r <rounds>`：发送轮次，`0` 表示持续发送
 - `-m <message>`：固定消息调试模式（会禁用高熵生成）
 - `-C <ca_cert.pem>`：上行握手 CA/cert（默认 `certs/cert.pem`）
 - `-E/-G`：客户端监听端证书/私钥（默认 `certs/cert.pem` / `certs/key.pem`）
-- `-a <alpn>`：默认 `qsc_cid_auth_v1`
+- `-a <alpn>`：默认 `h3`
 - `-n <sni>`：默认 `localhost`
 - `-i <iface> -f <bpf>`：启用模块 A 的实时采样节奏
 

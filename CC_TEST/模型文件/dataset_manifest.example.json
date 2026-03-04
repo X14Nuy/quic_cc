@@ -1,0 +1,19 @@
+{
+  "sources": [
+    {
+      "name": "baseline_legacy_local",
+      "path": "CC_TEST/提取数据/out_quic_data",
+      "label": 0
+    },
+    {
+      "name": "baseline_small_remote",
+      "path": "CC_TEST/提取数据/out_210634",
+      "label": 0
+    },
+    {
+      "name": "covert_remote_v2",
+      "path": "CC_TEST/提取数据/out_211837",
+      "label": 1
+    }
+  ]
+}

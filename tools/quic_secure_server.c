@@ -23,15 +23,17 @@
 #define QSC_PROJECT_ROOT "."
 #endif
 
-#define QS_DEFAULT_ALPN "qsc_cid_auth_v1"
+#define QS_DEFAULT_ALPN "h3"
 #define QS_DEFAULT_SNI "localhost"
 #define QS_MAX_FRAGMENTS 255U
 #define QS_MAX_FRAG_DATA (PCS_CID_MAX_LEN - PCS_CID_MIN_LEN)
 #define QS_CLIENT_IDLE_EXPIRE_SEC 3600U
-#define QS_DEFAULT_CLIENT_PUSH_PORT 5544U
+#define QS_DEFAULT_CLIENT_PUSH_PORT 0U
 #define QS_PUSH_CLOSE_DELAY_US 20000U
 #define QS_SEND_INTER_FRAG_DELAY_MS 10U
 #define QS_CMD_BUF_SIZE 2048U
+#define QS_AUTH_BUF_CAP 256U
+#define QS_AUTH_COVER_MAX 96U
 
 typedef struct server_session_s {
     uint32_t session_id;
@@ -46,6 +48,7 @@ typedef struct server_session_s {
 typedef struct server_client_entry_s {
     char ip[INET6_ADDRSTRLEN];
     uint16_t peer_port;
+    uint16_t push_port;
     time_t first_seen_utc;
     time_t last_seen_utc;
     double prev_gap_sec;
@@ -77,7 +80,7 @@ typedef struct server_conn_ctx_s {
 
 typedef struct push_conn_ctx_s {
     pcs_cid_fragment_t frag;
-    uint8_t proof_payload[PCS_AUTH_PAYLOAD_LEN];
+    uint8_t proof_payload[QS_AUTH_BUF_CAP];
     size_t proof_payload_len;
     uint8_t expected_ack_hash[PCS_HASH_LEN];
 
@@ -106,6 +109,7 @@ typedef struct server_opts_s {
 
 typedef struct push_target_s {
     char ip[INET6_ADDRSTRLEN];
+    uint16_t push_port;
 } push_target_t;
 
 static volatile sig_atomic_t g_stop = 0;
@@ -126,7 +130,7 @@ static void usage(const char *prog)
             "  -k <psk_hex>       shared key, 64 hex chars\n"
             "  -a <alpn>          ALPN (default: %s)\n"
             "  -c <cid_len>       CID length for server->client push, 8..20 (default: 20)\n"
-            "  -P <port>          client listen port for server push (default: %u)\n"
+            "  -P <port>          force client listen port for server push (default: auto)\n"
             "  -n <sni>           SNI for server push connections (default: %s)\n"
             "  -A <ca.pem>        CA file for server push (default: <project>/certs/cert.pem)\n"
             "\n"
@@ -137,7 +141,6 @@ static void usage(const char *prog)
             "  help\n",
             prog,
             QS_DEFAULT_ALPN,
-            QS_DEFAULT_CLIENT_PUSH_PORT,
             QS_DEFAULT_SNI);
 }
 
@@ -164,6 +167,69 @@ static void sleep_ms(uint32_t ms)
 
     while (nanosleep(&req, &req) == -1 && !g_stop) {
     }
+}
+
+static int append_random_cover(uint8_t *buf, size_t cap, size_t *len_inout, size_t cover_max)
+{
+    uint16_t r = 0U;
+    size_t cover_len;
+
+    if (buf == NULL || len_inout == NULL) {
+        return -1;
+    }
+    if (*len_inout > cap) {
+        return -2;
+    }
+    if (cover_max == 0U || *len_inout == cap) {
+        return 0;
+    }
+    if (RAND_bytes((uint8_t *)&r, sizeof(r)) != 1) {
+        r = (uint16_t)time(NULL);
+    }
+
+    cover_len = (size_t)(r % (cover_max + 1U));
+    if (cover_len > cap - *len_inout) {
+        cover_len = cap - *len_inout;
+    }
+    if (cover_len == 0U) {
+        return 0;
+    }
+    if (RAND_bytes(buf + *len_inout, (int)cover_len) != 1) {
+        return -3;
+    }
+    *len_inout += cover_len;
+    return 0;
+}
+
+static uint32_t random_u32(void)
+{
+    uint32_t v = 0U;
+
+    if (RAND_bytes((uint8_t *)&v, sizeof(v)) != 1) {
+        v = (uint32_t)time(NULL) ^ 0x5AB31E29U;
+    }
+    return v;
+}
+
+static uint8_t choose_cid_len_near_max(uint8_t cid_len_max)
+{
+    uint8_t low;
+    uint32_t span;
+
+    if (cid_len_max < PCS_CID_MIN_LEN) {
+        return PCS_CID_MIN_LEN;
+    }
+
+    low = (cid_len_max > 4U) ? (uint8_t)(cid_len_max - 4U) : PCS_CID_MIN_LEN;
+    if (low < PCS_CID_MIN_LEN) {
+        low = PCS_CID_MIN_LEN;
+    }
+    if (low > cid_len_max) {
+        low = cid_len_max;
+    }
+
+    span = (uint32_t)(cid_len_max - low + 1U);
+    return (uint8_t)(low + (random_u32() % span));
 }
 
 static void format_utc(time_t ts, char *out, size_t out_cap)
@@ -266,7 +332,9 @@ static server_client_entry_t *client_list_find_locked(server_runtime_t *rt, cons
     return NULL;
 }
 
-static void client_list_update_from_conn(server_runtime_t *rt, picoquic_cnx_t *cnx)
+static void client_list_update_from_conn(server_runtime_t *rt,
+                                         picoquic_cnx_t *cnx,
+                                         uint16_t push_port)
 {
     char ip[INET6_ADDRSTRLEN];
     uint16_t port = 0;
@@ -292,6 +360,7 @@ static void client_list_update_from_conn(server_runtime_t *rt, picoquic_cnx_t *c
         if (entry != NULL) {
             snprintf(entry->ip, sizeof(entry->ip), "%s", ip);
             entry->peer_port = port;
+            entry->push_port = push_port;
             entry->first_seen_utc = now_utc;
             entry->last_seen_utc = now_utc;
             entry->prev_gap_sec = 0.0;
@@ -303,6 +372,9 @@ static void client_list_update_from_conn(server_runtime_t *rt, picoquic_cnx_t *c
         entry->prev_gap_sec = difftime(now_utc, entry->last_seen_utc);
         entry->last_seen_utc = now_utc;
         entry->peer_port = port;
+        if (push_port != 0U) {
+            entry->push_port = push_port;
+        }
         entry->msg_count++;
     }
 
@@ -355,6 +427,7 @@ static size_t client_list_snapshot(server_runtime_t *rt,
     while (cur != NULL && idx < count) {
         if (send_all || strcmp(cur->ip, target) == 0) {
             snprintf(targets[idx].ip, sizeof(targets[idx].ip), "%s", cur->ip);
+            targets[idx].push_port = cur->push_port;
             idx++;
         }
         cur = cur->next;
@@ -389,9 +462,10 @@ static void client_list_print(server_runtime_t *rt)
         format_utc(cur->first_seen_utc, first_seen, sizeof(first_seen));
 
         fprintf(stdout,
-                "  ip=%s peer_port=%u first=%s age_since_last=%.0fs last_gap=%.0fs msg_count=%llu\n",
+                "  ip=%s peer_port=%u push_port=%u first=%s age_since_last=%.0fs last_gap=%.0fs msg_count=%llu\n",
                 cur->ip,
                 (unsigned)cur->peer_port,
+                (unsigned)cur->push_port,
                 first_seen,
                 age_sec,
                 cur->prev_gap_sec,
@@ -581,7 +655,7 @@ static int server_handle_auth(picoquic_cnx_t *cnx,
     pcs_auth_payload_t payload;
     uint8_t expected_hash[PCS_HASH_LEN];
     uint8_t ack_hash[PCS_HASH_LEN];
-    uint8_t ack_payload[PCS_AUTH_PAYLOAD_LEN];
+    uint8_t ack_payload[QS_AUTH_BUF_CAP];
     size_t ack_len = 0;
     int store_rc;
 
@@ -620,7 +694,7 @@ static int server_handle_auth(picoquic_cnx_t *cnx,
         return -7;
     }
 
-    client_list_update_from_conn(conn->runtime, cnx);
+    client_list_update_from_conn(conn->runtime, cnx, payload.push_port);
     session_emit_if_complete(conn->runtime, frag.session_id);
 
     if (pcs_compute_auth_hash(conn->runtime->psk,
@@ -630,11 +704,15 @@ static int server_handle_auth(picoquic_cnx_t *cnx,
                               ack_hash) != 0 ||
         pcs_build_auth_payload(PCS_MSG_SERVER_ACK,
                                &frag,
+                               0U,
                                ack_hash,
                                ack_payload,
                                sizeof(ack_payload),
                                &ack_len) != 0) {
         return -8;
+    }
+    if (append_random_cover(ack_payload, sizeof(ack_payload), &ack_len, QS_AUTH_COVER_MAX) != 0) {
+        return -10;
     }
 
     if (picoquic_add_to_stream(cnx, stream_id, ack_payload, ack_len, 1) != 0) {
@@ -691,14 +769,16 @@ static int server_stream_callback(picoquic_cnx_t *cnx,
                 (void)picoquic_close(cnx, 0x202);
                 return -1;
             }
-            fprintf(stdout,
-                    "[server] verified uplink fragment session=0x%08x idx=%u/%u\n",
-                    ((uint32_t)conn->recv_buf[6] << 24) |
-                        ((uint32_t)conn->recv_buf[7] << 16) |
-                        ((uint32_t)conn->recv_buf[8] << 8) |
-                        (uint32_t)conn->recv_buf[9],
-                    conn->recv_buf[10],
-                    conn->recv_buf[11]);
+            {
+                pcs_auth_payload_t parsed = {0};
+                if (pcs_parse_auth_payload(conn->recv_buf, conn->recv_len, &parsed) == 0) {
+                    fprintf(stdout,
+                            "[server] verified uplink fragment session=0x%08x idx=%u/%u\n",
+                            parsed.session_id,
+                            parsed.frag_idx,
+                            parsed.frag_total);
+                }
+            }
         }
         break;
 
@@ -885,11 +965,18 @@ static int run_push_fragment(const server_runtime_t *runtime,
                               conn_ctx.expected_ack_hash) != 0 ||
         pcs_build_auth_payload(PCS_MSG_SERVER_PUSH,
                                frag,
+                               0U,
                                proof_hash,
                                conn_ctx.proof_payload,
                                sizeof(conn_ctx.proof_payload),
                                &conn_ctx.proof_payload_len) != 0) {
         return -3;
+    }
+    if (append_random_cover(conn_ctx.proof_payload,
+                            sizeof(conn_ctx.proof_payload),
+                            &conn_ctx.proof_payload_len,
+                            QS_AUTH_COVER_MAX) != 0) {
+        return -9;
     }
 
     quic = picoquic_create(1,
@@ -965,27 +1052,50 @@ static int run_push_fragment(const server_runtime_t *runtime,
 
 static int send_message_to_one(server_runtime_t *rt,
                                const char *target_ip,
+                               uint16_t target_port,
                                const uint8_t *message,
                                size_t message_len)
 {
     uint32_t session_id = 0;
-    size_t frag_cap;
-    size_t frag_total;
+    typedef struct frag_plan_s {
+        uint8_t chunk;
+        uint8_t cid_len;
+    } frag_plan_t;
+    frag_plan_t plan[QS_MAX_FRAGMENTS];
+    size_t frag_total = 0;
     size_t offset = 0;
+    size_t remaining;
     size_t i;
 
     if (rt == NULL || target_ip == NULL || message == NULL || message_len == 0U) {
         return -1;
     }
 
-    frag_cap = pcs_cid_fragment_capacity(rt->cid_len);
-    if (frag_cap == 0U) {
+    if (pcs_cid_fragment_capacity(rt->cid_len) == 0U) {
         return -2;
     }
 
-    frag_total = (message_len + frag_cap - 1U) / frag_cap;
-    if (frag_total > QS_MAX_FRAGMENTS) {
-        return -3;
+    remaining = message_len;
+    while (remaining > 0U && frag_total < QS_MAX_FRAGMENTS) {
+        uint8_t cid_len = choose_cid_len_near_max(rt->cid_len);
+        size_t cap = pcs_cid_fragment_capacity(cid_len);
+        size_t chunk = (remaining < cap) ? remaining : cap;
+
+        if (cap == 0U) {
+            return -3;
+        }
+        if (chunk == 0U || chunk > 255U) {
+            return -4;
+        }
+
+        plan[frag_total].chunk = (uint8_t)chunk;
+        plan[frag_total].cid_len = cid_len;
+        remaining -= chunk;
+        frag_total++;
+    }
+
+    if (remaining > 0U || frag_total == 0U) {
+        return -5;
     }
 
     if (RAND_bytes((uint8_t *)&session_id, sizeof(session_id)) != 1) {
@@ -993,8 +1103,9 @@ static int send_message_to_one(server_runtime_t *rt,
     }
 
     fprintf(stdout,
-            "[server] push target=%s session=0x%08x len=%zu fragments=%zu\n",
+            "[server] push target=%s:%u session=0x%08x len=%zu fragments=%zu\n",
             target_ip,
+            (unsigned)target_port,
             session_id,
             message_len,
             frag_total);
@@ -1002,13 +1113,10 @@ static int send_message_to_one(server_runtime_t *rt,
     for (i = 0; i < frag_total; ++i) {
         pcs_cid_fragment_t frag;
         uint8_t cid[PCS_CID_MAX_LEN];
-        size_t chunk = message_len - offset;
+        size_t chunk = plan[i].chunk;
+        uint8_t cid_len = plan[i].cid_len;
         char cid_hex[PCS_CID_MAX_LEN * 2U + 1U];
         int rc;
-
-        if (chunk > frag_cap) {
-            chunk = frag_cap;
-        }
 
         memset(&frag, 0, sizeof(frag));
         frag.session_id = session_id;
@@ -1017,23 +1125,24 @@ static int send_message_to_one(server_runtime_t *rt,
         frag.data_len = (uint8_t)chunk;
         memcpy(frag.data, message + offset, chunk);
 
-        if (pcs_encode_cid_fragment(cid, rt->cid_len, &frag) != 0) {
-            return -4;
+        if (pcs_encode_cid_fragment(cid, cid_len, &frag) != 0) {
+            return -6;
         }
 
-        pcs_hex_encode(cid, rt->cid_len, cid_hex, sizeof(cid_hex));
+        pcs_hex_encode(cid, cid_len, cid_hex, sizeof(cid_hex));
         fprintf(stdout,
-                "[server] push fragment %zu/%zu to %s cid=%s\n",
+                "[server] push fragment %zu/%zu to %s cid_len=%u cid=%s\n",
                 i + 1U,
                 frag_total,
                 target_ip,
+                (unsigned)cid_len,
                 cid_hex);
 
         rc = run_push_fragment(rt,
                                target_ip,
-                               rt->client_push_port,
+                               target_port,
                                cid,
-                               rt->cid_len,
+                               cid_len,
                                &frag);
         if (rc != 0) {
             fprintf(stderr,
@@ -1042,12 +1151,13 @@ static int send_message_to_one(server_runtime_t *rt,
                     frag_total,
                     target_ip,
                     rc);
-            return -5;
+            return -7;
         }
 
         offset += chunk;
         if (!g_stop && (i + 1U) < frag_total) {
-            sleep_ms(QS_SEND_INTER_FRAG_DELAY_MS);
+            uint32_t jitter = random_u32() % (QS_SEND_INTER_FRAG_DELAY_MS + 1U);
+            sleep_ms((QS_SEND_INTER_FRAG_DELAY_MS / 2U) + jitter);
         }
     }
 
@@ -1071,7 +1181,17 @@ static int send_message_to_targets(server_runtime_t *rt,
     }
 
     for (i = 0; i < n && !g_stop; ++i) {
-        int rc = send_message_to_one(rt, targets[i].ip, message, message_len);
+        uint16_t effective_port = (rt->client_push_port != 0U) ? rt->client_push_port : targets[i].push_port;
+        int rc;
+
+        if (effective_port == 0U) {
+            fprintf(stderr,
+                    "[server] skip target=%s because push_port is unknown (wait for client proof update)\n",
+                    targets[i].ip);
+            continue;
+        }
+
+        rc = send_message_to_one(rt, targets[i].ip, effective_port, message, message_len);
         if (rc == 0) {
             ok++;
         }
@@ -1351,10 +1471,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "invalid CID length: %u (must be 8..20)\n", opts.cid_len);
         return 1;
     }
-    if (opts.client_push_port == 0U) {
-        fprintf(stderr, "invalid client push port\n");
-        return 1;
-    }
 
     if (opts.psk_hex != NULL) {
         if (opts.psk_hex[0] == '\0') {
@@ -1419,10 +1535,16 @@ int main(int argc, char **argv)
             opts.port,
             opts.alpn,
             opts.cert_file);
-    fprintf(stdout,
-            "[server] push CID len=%u push-port=%u\n",
-            runtime.cid_len,
-            (unsigned)runtime.client_push_port);
+    if (runtime.client_push_port == 0U) {
+        fprintf(stdout,
+                "[server] push CID len=%u push-port=auto(from client proof)\n",
+                runtime.cid_len);
+    } else {
+        fprintf(stdout,
+                "[server] push CID len=%u push-port=%u (forced)\n",
+                runtime.cid_len,
+                (unsigned)runtime.client_push_port);
+    }
 
     if (pthread_create(&cmd_tid, NULL, stdin_command_thread, &runtime) == 0) {
         cmd_thread_started = 1;

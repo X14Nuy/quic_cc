@@ -21,7 +21,8 @@ extern "C" {
 #define PCS_MSG_SERVER_PUSH 3U
 #define PCS_MSG_CLIENT_PUSH_ACK 4U
 
-#define PCS_AUTH_PAYLOAD_LEN 45U
+#define PCS_AUTH_FLAG_HAS_PUSH_PORT 0x01U
+#define PCS_AUTH_PAYLOAD_LEN 44U
 
 typedef struct pcs_cid_fragment_s {
     uint32_t session_id;
@@ -38,6 +39,8 @@ typedef struct pcs_auth_payload_s {
     uint8_t frag_idx;
     uint8_t frag_total;
     uint8_t data_len;
+    uint8_t flags;
+    uint16_t push_port;
     uint8_t hash[PCS_HASH_LEN];
 } pcs_auth_payload_t;
 
@@ -62,6 +65,7 @@ int pcs_compute_auth_hash(const uint8_t psk[PCS_PSK_LEN],
 
 int pcs_build_auth_payload(uint8_t msg_type,
                            const pcs_cid_fragment_t *frag,
+                           uint16_t push_port,
                            const uint8_t hash[PCS_HASH_LEN],
                            uint8_t *out,
                            size_t out_cap,

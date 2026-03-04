@@ -21,15 +21,18 @@
 #define QSC_PROJECT_ROOT "."
 #endif
 
-#define QC_DEFAULT_ALPN "qsc_cid_auth_v1"
+#define QC_DEFAULT_ALPN "h3"
 #define QC_DEFAULT_SNI "localhost"
 #define QC_DEFAULT_PROFILE_BPF "ip and udp"
 #define QC_DEFAULT_DELAY_MS 10U
-#define QC_DEFAULT_LISTEN_PORT 5544U
+#define QC_DEFAULT_LISTEN_PORT 0U
 #define QC_DEFAULT_INTERVAL_UNIT_SEC 60U
+#define QC_DEFAULT_FRAG_RETRIES 3U
 #define QC_MAX_FRAGMENTS 255U
 #define QC_MAX_FRAG_DATA (PCS_CID_MAX_LEN - PCS_CID_MIN_LEN)
 #define QC_CLOSE_DELAY_US 20000U
+#define QC_AUTH_BUF_CAP 256U
+#define QC_AUTH_COVER_MAX 96U
 
 typedef struct client_opts_s {
     const char *server;
@@ -49,13 +52,14 @@ typedef struct client_opts_s {
     uint32_t interval_unit_sec;
     uint32_t entropy_len;
     uint32_t rounds;
+    uint32_t frag_retries;
 
     const char *fixed_message;
 } client_opts_t;
 
 typedef struct uplink_conn_ctx_s {
     pcs_cid_fragment_t frag;
-    uint8_t proof_payload[PCS_AUTH_PAYLOAD_LEN];
+    uint8_t proof_payload[QC_AUTH_BUF_CAP];
     size_t proof_payload_len;
     uint8_t expected_ack_hash[PCS_HASH_LEN];
 
@@ -117,19 +121,20 @@ static void usage(const char *prog)
             "  -n <sni>           SNI (default: %s)\n"
             "  -i <iface>         enable Module-A pacing sample from interface\n"
             "  -f <profile_bpf>   BPF for pacing profile (default: %s)\n"
-            "  -L <listen_port>   local QUIC listen port for server push (default: %u)\n"
+            "  -L <listen_port>   local QUIC listen port for server push (default: random high port)\n"
             "  -E <cert.pem>      listener certificate (default: <project>/certs/cert.pem)\n"
             "  -G <key.pem>       listener private key (default: <project>/certs/key.pem)\n"
             "  -u <unit_sec>      seconds per interval unit (default: %u, i.e. minutes)\n"
             "  -e <bytes>         high-entropy message length (default: CID payload capacity)\n"
             "  -r <rounds>        send rounds, 0=forever (default 0)\n"
+            "  -R <retries>       retries per CID fragment on failure (default: %u)\n"
             "  -m <message>       fixed message (debug mode; disables entropy generation)\n",
             prog,
             QC_DEFAULT_ALPN,
             QC_DEFAULT_SNI,
             QC_DEFAULT_PROFILE_BPF,
-            QC_DEFAULT_LISTEN_PORT,
-            QC_DEFAULT_INTERVAL_UNIT_SEC);
+            QC_DEFAULT_INTERVAL_UNIT_SEC,
+            QC_DEFAULT_FRAG_RETRIES);
 }
 
 static int is_printable_ascii(const uint8_t *buf, size_t len)
@@ -195,6 +200,85 @@ static int entropy_fill(uint8_t *buf, size_t len)
     }
 
     return -2;
+}
+
+static int append_random_cover(uint8_t *buf, size_t cap, size_t *len_inout, size_t cover_max)
+{
+    uint16_t r = 0U;
+    size_t cover_len;
+
+    if (buf == NULL || len_inout == NULL) {
+        return -1;
+    }
+    if (*len_inout > cap) {
+        return -2;
+    }
+    if (cover_max == 0U || *len_inout == cap) {
+        return 0;
+    }
+    if (RAND_bytes((uint8_t *)&r, sizeof(r)) != 1) {
+        r = (uint16_t)time(NULL);
+    }
+
+    cover_len = (size_t)(r % (cover_max + 1U));
+    if (cover_len > cap - *len_inout) {
+        cover_len = cap - *len_inout;
+    }
+    if (cover_len == 0U) {
+        return 0;
+    }
+    if (RAND_bytes(buf + *len_inout, (int)cover_len) != 1) {
+        return -3;
+    }
+    *len_inout += cover_len;
+    return 0;
+}
+
+static uint32_t random_u32(void)
+{
+    uint32_t v = 0U;
+
+    if (RAND_bytes((uint8_t *)&v, sizeof(v)) != 1) {
+        v = (uint32_t)time(NULL) ^ 0xA5C31F27U;
+    }
+    return v;
+}
+
+static uint8_t choose_cid_len_near_max(uint8_t cid_len_max)
+{
+    uint8_t low;
+    uint32_t span;
+
+    if (cid_len_max < PCS_CID_MIN_LEN) {
+        return PCS_CID_MIN_LEN;
+    }
+
+    low = (cid_len_max > 4U) ? (uint8_t)(cid_len_max - 4U) : PCS_CID_MIN_LEN;
+    if (low < PCS_CID_MIN_LEN) {
+        low = PCS_CID_MIN_LEN;
+    }
+    if (low > cid_len_max) {
+        low = cid_len_max;
+    }
+
+    span = (uint32_t)(cid_len_max - low + 1U);
+    return (uint8_t)(low + (random_u32() % span));
+}
+
+static uint16_t pick_random_high_port(void)
+{
+    uint16_t v = 0;
+    uint16_t p;
+
+    if (RAND_bytes((uint8_t *)&v, sizeof(v)) != 1) {
+        v = (uint16_t)time(NULL);
+    }
+
+    p = (uint16_t)(20000U + (v % 40000U));
+    if (p == 0U) {
+        p = 20000U;
+    }
+    return p;
 }
 
 static downlink_session_t *downlink_session_find(client_runtime_t *rt, uint32_t session_id)
@@ -371,7 +455,7 @@ static int listener_handle_server_push(picoquic_cnx_t *cnx,
     pcs_auth_payload_t payload;
     uint8_t expected_hash[PCS_HASH_LEN];
     uint8_t ack_hash[PCS_HASH_LEN];
-    uint8_t ack_payload[PCS_AUTH_PAYLOAD_LEN];
+    uint8_t ack_payload[QC_AUTH_BUF_CAP];
     size_t ack_len = 0;
     int store_rc;
 
@@ -423,11 +507,15 @@ static int listener_handle_server_push(picoquic_cnx_t *cnx,
                               ack_hash) != 0 ||
         pcs_build_auth_payload(PCS_MSG_CLIENT_PUSH_ACK,
                                &frag,
+                               0U,
                                ack_hash,
                                ack_payload,
                                sizeof(ack_payload),
                                &ack_len) != 0) {
         return -8;
+    }
+    if (append_random_cover(ack_payload, sizeof(ack_payload), &ack_len, QC_AUTH_COVER_MAX) != 0) {
+        return -10;
     }
 
     if (picoquic_add_to_stream(cnx, stream_id, ack_payload, ack_len, 1) != 0) {
@@ -485,14 +573,16 @@ static int listener_stream_callback(picoquic_cnx_t *cnx,
                 (void)picoquic_close(cnx, 0x302);
                 return -1;
             }
-            fprintf(stdout,
-                    "[client] verified downlink fragment session=0x%08x idx=%u/%u\n",
-                    ((uint32_t)conn->recv_buf[6] << 24) |
-                        ((uint32_t)conn->recv_buf[7] << 16) |
-                        ((uint32_t)conn->recv_buf[8] << 8) |
-                        (uint32_t)conn->recv_buf[9],
-                    conn->recv_buf[10],
-                    conn->recv_buf[11]);
+            {
+                pcs_auth_payload_t parsed = {0};
+                if (pcs_parse_auth_payload(conn->recv_buf, conn->recv_len, &parsed) == 0) {
+                    fprintf(stdout,
+                            "[client] verified downlink fragment session=0x%08x idx=%u/%u\n",
+                            parsed.session_id,
+                            parsed.frag_idx,
+                            parsed.frag_total);
+                }
+            }
         }
         break;
 
@@ -761,11 +851,18 @@ static int run_one_uplink_fragment(const client_runtime_t *rt,
                               conn_ctx.expected_ack_hash) != 0 ||
         pcs_build_auth_payload(PCS_MSG_CLIENT_PROOF,
                                frag,
+                               rt->opts.listen_port,
                                proof_hash,
                                conn_ctx.proof_payload,
                                sizeof(conn_ctx.proof_payload),
                                &conn_ctx.proof_payload_len) != 0) {
         return -2;
+    }
+    if (append_random_cover(conn_ctx.proof_payload,
+                            sizeof(conn_ctx.proof_payload),
+                            &conn_ctx.proof_payload_len,
+                            QC_AUTH_COVER_MAX) != 0) {
+        return -8;
     }
 
     quic = picoquic_create(1,
@@ -847,23 +944,45 @@ static int send_uplink_message(client_runtime_t *rt,
                                traffic_profile_engine_t *profile)
 {
     uint32_t session_id = 0;
-    size_t frag_cap;
-    size_t frag_total;
+    typedef struct frag_plan_s {
+        uint8_t chunk;
+        uint8_t cid_len;
+    } frag_plan_t;
+    frag_plan_t plan[255];
+    size_t frag_total = 0;
     size_t offset = 0;
+    size_t remaining;
     size_t i;
 
     if (rt == NULL || server_addr == NULL || msg == NULL || msg_len == 0U) {
         return -1;
     }
 
-    frag_cap = pcs_cid_fragment_capacity(rt->opts.cid_len);
-    if (frag_cap == 0U) {
+    if (pcs_cid_fragment_capacity(rt->opts.cid_len) == 0U) {
         return -2;
     }
 
-    frag_total = (msg_len + frag_cap - 1U) / frag_cap;
-    if (frag_total > 255U) {
-        return -3;
+    remaining = msg_len;
+    while (remaining > 0U && frag_total < 255U) {
+        uint8_t cid_len = choose_cid_len_near_max(rt->opts.cid_len);
+        size_t cap = pcs_cid_fragment_capacity(cid_len);
+        size_t chunk = (remaining < cap) ? remaining : cap;
+
+        if (cap == 0U) {
+            return -3;
+        }
+        if (chunk == 0U || chunk > 255U) {
+            return -4;
+        }
+
+        plan[frag_total].chunk = (uint8_t)chunk;
+        plan[frag_total].cid_len = cid_len;
+        remaining -= chunk;
+        frag_total++;
+    }
+
+    if (remaining > 0U || frag_total == 0U) {
+        return -5;
     }
 
     if (RAND_bytes((uint8_t *)&session_id, sizeof(session_id)) != 1) {
@@ -879,13 +998,11 @@ static int send_uplink_message(client_runtime_t *rt,
     for (i = 0; i < frag_total && !g_stop; ++i) {
         pcs_cid_fragment_t frag;
         uint8_t cid[PCS_CID_MAX_LEN];
-        size_t chunk = msg_len - offset;
+        size_t chunk = plan[i].chunk;
+        uint8_t cid_len = plan[i].cid_len;
         char cid_hex[PCS_CID_MAX_LEN * 2U + 1U];
         int rc;
-
-        if (chunk > frag_cap) {
-            chunk = frag_cap;
-        }
+        uint32_t attempt;
 
         memset(&frag, 0, sizeof(frag));
         frag.session_id = session_id;
@@ -894,31 +1011,62 @@ static int send_uplink_message(client_runtime_t *rt,
         frag.data_len = (uint8_t)chunk;
         memcpy(frag.data, msg + offset, chunk);
 
-        if (pcs_encode_cid_fragment(cid, rt->opts.cid_len, &frag) != 0) {
-            return -4;
+        if (pcs_encode_cid_fragment(cid, cid_len, &frag) != 0) {
+            return -6;
         }
 
-        pcs_hex_encode(cid, rt->opts.cid_len, cid_hex, sizeof(cid_hex));
+        pcs_hex_encode(cid, cid_len, cid_hex, sizeof(cid_hex));
         fprintf(stdout,
-                "[client] sending uplink fragment %zu/%zu cid=%s\n",
+                "[client] sending uplink fragment %zu/%zu cid_len=%u cid=%s\n",
                 i + 1U,
                 frag_total,
+                (unsigned)cid_len,
                 cid_hex);
 
-        rc = run_one_uplink_fragment(rt, server_addr, cid, rt->opts.cid_len, &frag);
-        if (rc != 0) {
+        rc = -1;
+        for (attempt = 0U; attempt <= rt->opts.frag_retries && !g_stop; ++attempt) {
+            uint32_t retry_delay_ms;
+
+            rc = run_one_uplink_fragment(rt, server_addr, cid, cid_len, &frag);
+            if (rc == 0) {
+                break;
+            }
+
+            if (attempt >= rt->opts.frag_retries) {
+                break;
+            }
+
+            retry_delay_ms = sample_delay_ms(profile_enabled, profile);
+            if (retry_delay_ms < 80U) {
+                retry_delay_ms = 80U;
+            }
+            retry_delay_ms += (random_u32() % (retry_delay_ms + 1U));
+
             fprintf(stderr,
-                    "[client] uplink fragment %zu/%zu failed (rc=%d)\n",
+                    "[client] fragment %zu/%zu attempt %u failed (rc=%d), retry in %ums\n",
                     i + 1U,
                     frag_total,
+                    attempt + 1U,
+                    rc,
+                    retry_delay_ms);
+            sleep_ms(retry_delay_ms);
+        }
+
+        if (rc != 0) {
+            fprintf(stderr,
+                    "[client] uplink fragment %zu/%zu failed after %u retries (rc=%d)\n",
+                    i + 1U,
+                    frag_total,
+                    rt->opts.frag_retries,
                     rc);
-            return -5;
+            return -7;
         }
 
         offset += chunk;
 
         if ((i + 1U) < frag_total) {
             uint32_t delay_ms = sample_delay_ms(profile_enabled, profile);
+            delay_ms = (delay_ms / 2U) + (random_u32() % (delay_ms + 1U));
             sleep_ms(delay_ms);
         }
     }
@@ -930,12 +1078,35 @@ static uint64_t compute_next_interval_sec(uint32_t unit_sec)
 {
     uint64_t utc_now = (uint64_t)time(NULL);
     uint64_t minutes = utc_now % 60ULL;
+    uint64_t base;
+    uint16_t rnd = 0U;
+    int32_t jitter_sign;
+    uint64_t jitter_abs;
 
     if (minutes == 0ULL) {
         minutes = 1ULL;
     }
 
-    return minutes * (uint64_t)unit_sec;
+    base = minutes * (uint64_t)unit_sec;
+
+    /*
+     * Keep the requested UTC%60 periodicity as baseline, but add bounded
+     * jitter to avoid a rigid timing fingerprint.
+     */
+    if (RAND_bytes((uint8_t *)&rnd, sizeof(rnd)) != 1) {
+        rnd = (uint16_t)time(NULL);
+    }
+    jitter_sign = (rnd & 0x1U) ? 1 : -1;
+    jitter_abs = (uint64_t)((rnd >> 1) % ((base / 5ULL) + 1ULL)); /* <=20% */
+
+    if (jitter_sign < 0) {
+        if (jitter_abs >= base) {
+            return 1ULL;
+        }
+        return base - jitter_abs;
+    }
+
+    return base + jitter_abs;
 }
 
 static int build_entropy_message(client_runtime_t *rt,
@@ -1027,8 +1198,9 @@ int main(int argc, char **argv)
     runtime.opts.listen_cert = default_cert;
     runtime.opts.listen_key = default_key;
     runtime.opts.interval_unit_sec = QC_DEFAULT_INTERVAL_UNIT_SEC;
+    runtime.opts.frag_retries = QC_DEFAULT_FRAG_RETRIES;
 
-    while ((opt = getopt(argc, argv, "s:p:k:c:C:a:n:i:f:L:E:G:u:e:r:m:h")) != -1) {
+    while ((opt = getopt(argc, argv, "s:p:k:c:C:a:n:i:f:L:E:G:u:e:r:R:m:h")) != -1) {
         switch (opt) {
         case 's':
             runtime.opts.server = optarg;
@@ -1075,6 +1247,9 @@ int main(int argc, char **argv)
         case 'r':
             runtime.opts.rounds = (uint32_t)strtoul(optarg, NULL, 10);
             break;
+        case 'R':
+            runtime.opts.frag_retries = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
         case 'm':
             runtime.opts.fixed_message = optarg;
             break;
@@ -1092,12 +1267,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "invalid CID length: %u (must be 8..20)\n", runtime.opts.cid_len);
         return 1;
     }
-    if (runtime.opts.listen_port == 0U) {
-        fprintf(stderr, "invalid listen port\n");
-        return 1;
-    }
     if (runtime.opts.interval_unit_sec == 0U) {
         fprintf(stderr, "invalid interval unit sec\n");
+        return 1;
+    }
+    if (runtime.opts.frag_retries > 20U) {
+        fprintf(stderr, "invalid fragment retries: %u (must be <=20)\n", runtime.opts.frag_retries);
         return 1;
     }
 
@@ -1137,6 +1312,10 @@ int main(int argc, char **argv)
 
     if (strcmp(runtime.opts.sni, QC_DEFAULT_SNI) == 0 && is_name) {
         runtime.opts.sni = runtime.opts.server;
+    }
+
+    if (runtime.opts.listen_port == 0U) {
+        runtime.opts.listen_port = pick_random_high_port();
     }
 
     if (runtime.opts.iface != NULL) {

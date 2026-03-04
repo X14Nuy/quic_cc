@@ -17,3 +17,13 @@ Makefile
 *.log
 *.tmp
 /tmp/
+
+# Research artifacts (do not commit large/generated data)
+CC_TEST/日志/
+CC_TEST/抓包文件/
+CC_TEST/造数据/*.pcap
+CC_TEST/提取数据/out_*/
+CC_TEST/提取数据/__pycache__/
+CC_TEST/模型文件/out/
+CC_TEST/模型文件/.venv/
+CC_TEST/模型文件/__pycache__/
