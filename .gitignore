@@ -1,0 +1,19 @@
+# Build outputs
+/build/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Editor and OS artifacts
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Runtime logs / temp files
+*.log
+*.tmp
+/tmp/
